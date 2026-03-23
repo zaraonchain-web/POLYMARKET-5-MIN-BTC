@@ -254,9 +254,7 @@ class PolymarketFeed:
         """Parse Polymarket CLOB order book message and update prices/spread."""
         try:
             msg = json.loads(raw)
-            event_type = msg.get("event_type") or msg.get("type") or ""
-
-            # Handle both array and single-object message formats
+            # WS always returns a list of order book snapshots/updates
             events = msg if isinstance(msg, list) else [msg]
 
             for event in events:
