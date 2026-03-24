@@ -76,6 +76,7 @@ async def signal_loop(
     """
     summary_interval = config.get("logging", {}).get("summary_interval_seconds", 60)
     last_summary_ts = time.time()
+    last_diag_ts = time.time()
 
     log.info(f"[Main] Signal loop started in {mode.upper()} mode")
 
@@ -101,6 +102,27 @@ async def signal_loop(
 
             if signal is not None:
                 await executor.enter(signal, polymarket_feed)
+
+            # ── Diagnostic ticker every 30s ───────────────────────────────
+            now_diag = time.time()
+            if now_diag - last_diag_ts >= 30:
+                last_diag_ts = now_diag
+                try:
+                    p_now = binance_feed.price
+                    p_then = binance_feed.price_n_seconds_ago(config["signal"]["price_window_seconds"])
+                    pct = ((p_now - p_then) / p_then * 100.0) if (p_then and p_then > 0) else None
+                    up_px = polymarket_feed.up_price
+                    spread = polymarket_feed.spread
+                    threshold = config["signal"]["price_change_threshold_pct"]
+                    log.info(
+                        f"[Diag] BTC={p_now:.2f} | 30s_chg={pct:+.4f}% (need ±{threshold}%) | "
+                        f"PM_UP={up_px:.3f} | spread={spread:.4f}"
+                        if pct is not None else
+                        f"[Diag] BTC={p_now:.2f} | 30s_chg=N/A (building history) | "
+                        f"PM_UP={up_px} | spread={spread}"
+                    )
+                except Exception:
+                    pass
 
             # ── Periodic P&L summary ─────────────────────────────────────────
             now = time.time()
