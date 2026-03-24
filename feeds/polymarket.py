@@ -59,6 +59,7 @@ class PolymarketFeed:
         self._best_bid:  Optional[float] = None
         self._best_ask:  Optional[float] = None
         self._connected = False
+        self._force_reconnect = False  # set True from outside to trigger WS reconnect
 
     @property
     def is_connected(self) -> bool:
@@ -177,6 +178,9 @@ class PolymarketFeed:
                     log.info("[Polymarket] Subscribed to order book for {}".format(self.market_id))
 
                     async for raw in ws:
+                        if self._force_reconnect:
+                            self._force_reconnect = False
+                            break
                         await self._handle_message(raw)
 
             except ConnectionClosed as e:
