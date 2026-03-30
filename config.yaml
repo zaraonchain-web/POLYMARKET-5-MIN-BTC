@@ -23,7 +23,7 @@ signal:
   polymarket_min_price: 0.25
   polymarket_max_price: 0.75
   # Minimum edge (|fair_prob - polymarket_price|) required to enter
-  min_edge: 0.07
+  min_edge: 0.12
 
 # --- Position Management ---
 position:
@@ -43,7 +43,7 @@ risk:
   # Don't enter trade in last N seconds of a 5-min market window
   settlement_buffer_seconds: 60
   # Skip signal if order book spread > this
-  max_spread: 0.05
+  max_spread: 0.03
   # 5-minute market window duration (seconds) — used for settlement guard
   market_window_seconds: 300
 
