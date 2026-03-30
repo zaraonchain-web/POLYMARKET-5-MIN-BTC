@@ -221,13 +221,15 @@ class LatencyArbStrategy:
                 fair_prob = 1.0 - fair_up_prob        # fair DOWN probability
                 edge = fair_prob - polymarket_price   # DOWN token edge
 
-            # ── Guard 4: edge must exceed minimum threshold ──────────────────
-            # This ensures we're not entering on a tiny mis-pricing that fees
-            # would eat alive.
-            if abs(edge) < self.min_edge:
+            # ── Guard 4: edge must be POSITIVE and exceed minimum threshold ─────
+            # edge = fair_prob - polymarket_price
+            # POSITIVE: token is underpriced vs our fair value → buy it (good)
+            # NEGATIVE: token is OVERpriced → wrong direction, skip
+            # Using abs() was a bug: it allowed buying overpriced tokens.
+            if edge < self.min_edge:
                 log.debug(
-                    f"[Strategy] Signal rejected: |edge| {abs(edge):.3f} < "
-                    f"min_edge {self.min_edge}"
+                    f"[Strategy] Signal rejected: edge {edge:+.3f} < "
+                    f"min_edge {self.min_edge} (need positive edge)"
                 )
                 return None
 
