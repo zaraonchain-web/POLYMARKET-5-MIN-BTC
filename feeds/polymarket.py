@@ -56,8 +56,10 @@ class PolymarketFeed:
         self.up_price:   Optional[float] = None
         self.down_price: Optional[float] = None
         self.spread:     Optional[float] = None
-        self._best_bid:  Optional[float] = None
-        self._best_ask:  Optional[float] = None
+        self._best_bid:  Optional[float] = None   # UP token best bid
+        self._best_ask:  Optional[float] = None   # UP token best ask
+        self._down_best_bid: Optional[float] = None  # DOWN token best bid
+        self._down_best_ask: Optional[float] = None  # DOWN token best ask
         self._connected = False
         self._force_reconnect = False  # set True from outside to trigger WS reconnect
 
@@ -275,6 +277,9 @@ class PolymarketFeed:
     def _recompute_down_price(self) -> None:
         best_bid = max(self._down_bids.keys(), default=None)
         best_ask = min(self._down_asks.keys(), default=None)
+
+        self._down_best_bid = best_bid
+        self._down_best_ask = best_ask
 
         if best_bid is not None and best_ask is not None:
             self.down_price = (best_bid + best_ask) / 2
