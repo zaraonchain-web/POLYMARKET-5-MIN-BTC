@@ -101,6 +101,22 @@ class TestExecutor:
             return False
 
         try:
+            # --- Book freshness check ---
+            if signal.direction == Direction.UP:
+                book_age = time.time() - getattr(polymarket_feed, "_up_book_last_updated", 0.0)
+                if book_age > 10:
+                    log.warning(
+                        "[TestExecutor] Skipping — UP book stale ({:.1f}s old)".format(book_age)
+                    )
+                    return False
+            else:
+                book_age = time.time() - getattr(polymarket_feed, "_down_book_last_updated", 0.0)
+                if book_age > 10:
+                    log.warning(
+                        "[TestExecutor] Skipping — DOWN book stale ({:.1f}s old)".format(book_age)
+                    )
+                    return False
+
             if signal.direction == Direction.UP:
                 # Buying UP token — we pay the ASK (taker)
                 ask = polymarket_feed._best_ask
@@ -119,10 +135,10 @@ class TestExecutor:
                 else:
                     fill_price = None
 
-            # Sanity check: fill price must be in (0.01, 0.99)
-            if fill_price is None or not (0.01 < fill_price < 0.99):
-                log_error(
-                    "[TestExecutor] Skipping — fill price out of range: {}".format(fill_price)
+            # Sanity check: fill price must be in (0.20, 0.80) to reject stale book values
+            if fill_price is None or not (0.20 < fill_price < 0.80):
+                log.warning(
+                    "[TestExecutor] Skipping — fill price out of range (0.20-0.80): {}".format(fill_price)
                 )
                 return False
 
@@ -202,8 +218,8 @@ class TestExecutor:
                 # P&L based on bid vs ask fill (realistic)
                 pct_profit = (exit_price - pos.entry_price) / pos.entry_price
 
-                # Exit 1: take-profit
-                if pct_profit >= self.take_profit_pct:
+                # Exit 1: take-profit (only after 30s minimum hold to prevent stale-book TP)
+                if hold_elapsed >= 30 and pct_profit >= self.take_profit_pct:
                     await self._close_position(exit_price, hold_elapsed, reason="take-profit")
                     return
 
