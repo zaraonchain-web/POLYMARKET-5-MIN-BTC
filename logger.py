@@ -54,7 +54,7 @@ log = logging.getLogger("bot")
 
 def _ensure_csv_header():
     """Create results.csv with header row if it doesn't exist yet."""
-    if not RESULTS_CSV.exists():
+    if not RESULTS_CSV.exists() or RESULTS_CSV.stat().st_size == 0:
         with open(RESULTS_CSV, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=RESULTS_FIELDNAMES)
             writer.writeheader()
