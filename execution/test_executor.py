@@ -35,9 +35,9 @@ from strategy.latency_arb import Signal, Direction
 from execution.utils import taker_fee_rate
 
 
-def _taker_fee_rate(token_price: float) -> float:
+def _taker_fee_rate(token_price: float, live_fee_rate: float = None) -> float:
     """Alias for backward compatibility — delegates to shared utils."""
-    return taker_fee_rate(token_price)
+    return taker_fee_rate(token_price, live_fee_rate)
 
 
 @dataclass
@@ -50,6 +50,7 @@ class SimPosition:
     size_usdc:     float
     edge_at_entry: float
     entry_fee:     float    # USDC fee paid on entry
+    fee_rate:      float    # live fee rate at entry (fraction, e.g. 0.018)
     signal:        Signal
 
 
@@ -127,7 +128,8 @@ class TestExecutor:
                 return False
 
             # Taker fee on entry (charged on USDC notional)
-            entry_fee_rate = _taker_fee_rate(fill_price)
+            live_rate = getattr(polymarket_feed, "fee_rate", None)
+            entry_fee_rate = _taker_fee_rate(fill_price, live_rate)
             entry_fee_usdc = self.max_trade_size_usdc * entry_fee_rate
 
             pos = SimPosition(
@@ -138,6 +140,7 @@ class TestExecutor:
                 size_usdc=self.max_trade_size_usdc,
                 edge_at_entry=signal.edge,
                 entry_fee=entry_fee_usdc,
+                fee_rate=live_rate,
                 signal=signal,
             )
             self.open_position = pos
@@ -230,7 +233,7 @@ class TestExecutor:
 
         try:
             # Taker fee on exit
-            exit_fee_rate = _taker_fee_rate(exit_price)
+            exit_fee_rate = _taker_fee_rate(exit_price, pos.fee_rate)
             exit_fee_usdc = pos.size_usdc * exit_fee_rate
             total_fee     = pos.entry_fee + exit_fee_usdc
 
