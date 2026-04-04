@@ -24,6 +24,7 @@ from typing import Optional
 
 from logger import log, log_trade, log_error
 from strategy.latency_arb import Signal, Direction
+from execution.utils import taker_fee_rate
 
 
 def _import_clob_client():
@@ -333,12 +334,19 @@ class LiveExecutor:
             # P&L uses sell_price (actual fill) not exit_price (the bid that
             # triggered the decision). sell_price = exit_price - 0.01, so using
             # exit_price would overstate net P&L by ~0.01 * shares per trade.
-            pnl_usdc = (sell_price - pos.entry_price) * pos.shares
+            # Fees are charged on USDC notional for both entry and exit legs.
+            entry_fee_usdc = pos.size_usdc * taker_fee_rate(pos.entry_price)
+            exit_fee_usdc  = pos.size_usdc * taker_fee_rate(sell_price)
+            total_fees     = entry_fee_usdc + exit_fee_usdc
+
+            gross_pnl = (sell_price - pos.entry_price) * pos.shares
+            pnl_usdc  = gross_pnl - total_fees
 
             log.info(
-                "[LIVE] EXIT {} | reason={} entry={:.4f} fill={:.4f} hold={:.0f}s pnl={:+.4f} USDC".format(
+                "[LIVE] EXIT {} | reason={} entry={:.4f} fill={:.4f} hold={:.0f}s "
+                "gross={:+.4f} fees=-{:.3f} net={:+.4f} USDC".format(
                     pos.direction.value, reason, pos.entry_price,
-                    sell_price, hold_seconds, pnl_usdc
+                    sell_price, hold_seconds, gross_pnl, total_fees, pnl_usdc
                 )
             )
 
