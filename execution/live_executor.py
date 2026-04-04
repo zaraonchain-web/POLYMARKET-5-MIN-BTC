@@ -51,6 +51,7 @@ class LivePosition:
     order_id: str
     token_id: str
     shares: float          # number of shares held (needed for sell sizing)
+    fee_rate: float        # live fee rate at time of entry (fraction)
 
 
 class LiveExecutor:
@@ -192,6 +193,7 @@ class LiveExecutor:
                 order_id=order_id,
                 token_id=token_id,
                 shares=shares,
+                fee_rate=getattr(polymarket_feed, "fee_rate", None),
             )
             self.open_position = pos
 
@@ -335,8 +337,8 @@ class LiveExecutor:
             # triggered the decision). sell_price = exit_price - 0.01, so using
             # exit_price would overstate net P&L by ~0.01 * shares per trade.
             # Fees are charged on USDC notional for both entry and exit legs.
-            entry_fee_usdc = pos.size_usdc * taker_fee_rate(pos.entry_price)
-            exit_fee_usdc  = pos.size_usdc * taker_fee_rate(sell_price)
+            entry_fee_usdc = pos.size_usdc * taker_fee_rate(pos.entry_price, pos.fee_rate)
+            exit_fee_usdc  = pos.size_usdc * taker_fee_rate(sell_price, pos.fee_rate)
             total_fees     = entry_fee_usdc + exit_fee_usdc
 
             gross_pnl = (sell_price - pos.entry_price) * pos.shares
