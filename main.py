@@ -13,6 +13,20 @@ The main loop:
     5. Every 1 second: evaluate signal → execute if conditions met
     6. Every 60 seconds: print P&L summary to terminal
     7. All exceptions are caught and logged; the loop never exits
+
+Fixes applied (v2):
+  1. executor.has_open_position is now passed into strategy.evaluate() so
+     the strategy's deduplication guard is actually wired up.
+  2. Market expiry resets via polymarket_feed.reset_book() instead of
+     poking private attributes directly.
+  3. _reconnect_triggered replaced with a proper asyncio.Event so the
+     reconnect guard is state-based, not time-based.
+  4. asyncio.gather return values are inspected — dead feed tasks are
+     logged as errors rather than swallowed silently.
+  5. Diagnostic ticker None-checks price before formatting, and logs
+     a warning instead of silently passing on failure.
+  6. Market refresh is debounced: once a refresh is in-flight, subsequent
+     ticks skip the refresh block until it completes.
 """
 
 import argparse
@@ -78,6 +92,10 @@ async def signal_loop(
     last_summary_ts = time.time()
     last_diag_ts = time.time()
 
+    # Guards against launching concurrent refreshes if fetch_active_market()
+    # takes longer than one tick (or the market stays expired for several ticks).
+    _refresh_in_flight = False
+
     log.info(f"[Main] Signal loop started in {mode.upper()} mode")
 
     while True:
@@ -85,61 +103,78 @@ async def signal_loop(
             await asyncio.sleep(1)
 
             # ── Check if Polymarket market has expired (new 5-min window) ────
-            if polymarket_feed.refresh_if_expired():
+            # Debounced: skip if a refresh is already in progress.
+            if polymarket_feed.refresh_if_expired() and not _refresh_in_flight:
+                _refresh_in_flight = True
                 log.info("[Main] Market window expired — re-fetching active market")
-                # Clear stale order book and force WS reconnect to new market
-                polymarket_feed._up_bids.clear()
-                polymarket_feed._up_asks.clear()
-                polymarket_feed._down_bids.clear()
-                polymarket_feed._down_asks.clear()
-                polymarket_feed._best_bid = None
-                polymarket_feed._best_ask = None
-                polymarket_feed.spread = None
+
+                # Delegate book reset to the feed (no private-attribute poking).
+                polymarket_feed.reset_book()
+
                 ok = await polymarket_feed.fetch_active_market()
-                # Signal WS run() to reconnect with new token IDs (only once per window)
-                if not getattr(polymarket_feed, "_reconnect_triggered", False):
-                    polymarket_feed._force_reconnect = True
-                    polymarket_feed._reconnect_triggered = True
-                    # Reset the flag after the next window fetch completes
-                    asyncio.get_event_loop().call_later(10, lambda: setattr(polymarket_feed, "_reconnect_triggered", False))
-                if not ok:
+
+                if ok:
+                    # Signal the WS task to reconnect to the new token IDs.
+                    # Use an asyncio.Event so state is explicit, not time-based.
+                    polymarket_feed.request_reconnect()
+                else:
                     log.warning("[Main] No active market found — waiting 15s")
                     await asyncio.sleep(15)
+
+                _refresh_in_flight = False
+                if not ok:
                     continue
 
-            # ── Skip if there's already an open position ─────────────────────
-            if executor.has_open_position:
+            # ── Skip tick if a refresh is in flight ──────────────────────────
+            if _refresh_in_flight:
                 continue
 
-            # ── Evaluate signal ───────────────────────────────────────────────
-            signal = strategy.evaluate(binance_feed, polymarket_feed)
+            # ── Evaluate signal (pass open-position state into strategy) ──────
+            # has_open_position is checked both here (fast path) and inside
+            # strategy.evaluate() (redundant safety net). Both must agree.
+            has_open = executor.has_open_position
 
-            if signal is not None:
-                await executor.enter(signal, polymarket_feed)
+            if not has_open:
+                signal = strategy.evaluate(
+                    binance_feed,
+                    polymarket_feed,
+                    has_open_position=has_open,
+                )
+                if signal is not None:
+                    await executor.enter(signal, polymarket_feed)
 
-            # ── Diagnostic ticker every 30s ───────────────────────────────
-            now_diag = time.time()
-            if now_diag - last_diag_ts >= 30:
-                last_diag_ts = now_diag
+            # ── Diagnostic ticker every 30s ───────────────────────────────────
+            now = time.time()
+            if now - last_diag_ts >= 30:
+                last_diag_ts = now
                 try:
                     p_now = binance_feed.price
-                    p_then = binance_feed.price_n_seconds_ago(config["signal"]["price_window_seconds"])
-                    pct = ((p_now - p_then) / p_then * 100.0) if (p_then and p_then > 0) else None
-                    up_px = polymarket_feed.up_price
-                    spread = polymarket_feed.spread
-                    threshold = config["signal"]["price_change_threshold_pct"]
-                    log.info(
-                        f"[Diag] BTC={p_now:.2f} | 30s_chg={pct:+.4f}% (need ±{threshold}%) | "
-                        f"PM_UP={up_px:.3f} | spread={spread:.4f}"
-                        if pct is not None else
-                        f"[Diag] BTC={p_now:.2f} | 30s_chg=N/A (building history) | "
-                        f"PM_UP={up_px} | spread={spread}"
-                    )
-                except Exception:
-                    pass
+                    if p_now is None:
+                        log.warning("[Diag] Binance price unavailable")
+                    else:
+                        window = config["signal"]["price_window_seconds"]
+                        p_then = binance_feed.price_n_seconds_ago(window)
+                        threshold = config["signal"]["price_change_threshold_pct"]
+                        up_px = polymarket_feed.up_price
+                        spread = polymarket_feed.spread
 
-            # ── Periodic P&L summary ─────────────────────────────────────────
-            now = time.time()
+                        if p_then and p_then > 0:
+                            pct = (p_now - p_then) / p_then * 100.0
+                            log.info(
+                                f"[Diag] BTC={p_now:.2f} | "
+                                f"{window}s_chg={pct:+.4f}% (need ±{threshold}%) | "
+                                f"PM_UP={up_px} | spread={spread}"
+                            )
+                        else:
+                            log.info(
+                                f"[Diag] BTC={p_now:.2f} | "
+                                f"{window}s_chg=N/A (building history) | "
+                                f"PM_UP={up_px} | spread={spread}"
+                            )
+                except Exception as e:
+                    log.warning(f"[Diag] Diagnostic ticker error: {e}")
+
+            # ── Periodic P&L summary ──────────────────────────────────────────
             if now - last_summary_ts >= summary_interval:
                 print_pnl_summary(mode)
                 last_summary_ts = now
@@ -149,7 +184,7 @@ async def signal_loop(
             break
         except Exception as e:
             log_error("[Main] Unexpected error in signal loop", e)
-            await asyncio.sleep(1)  # brief pause before retrying
+            await asyncio.sleep(1)
 
 
 async def main(mode: str) -> None:
@@ -189,7 +224,7 @@ async def main(mode: str) -> None:
     # ── Initialise strategy ───────────────────────────────────────────────────
     strategy = LatencyArbStrategy(config)
 
-    # ── Initialise executor (test or live) ────────────────────────────────────
+    # ── Initialise executor (test or live) ───────────────────────────────────
     if mode == "test":
         executor = TestExecutor(config, strategy)
         log.info("[Main] Test executor initialised — simulated fills only")
@@ -198,15 +233,24 @@ async def main(mode: str) -> None:
         log.info("[Main] Live executor initialised — REAL orders will be placed")
 
     # ── Launch all tasks concurrently ─────────────────────────────────────────
-    # Both WebSocket feeds and the signal loop run as concurrent asyncio tasks.
-    # They are never REST-polled — all data is pushed via WebSocket.
+    # return_exceptions=True prevents one crashed task from cancelling the
+    # others mid-run. We inspect results after gather() so crashes don't
+    # vanish silently.
     log.info("[Main] Launching concurrent tasks: Binance WS, Polymarket WS, signal loop")
-    await asyncio.gather(
+    results = await asyncio.gather(
         binance_feed.run(),
         polymarket_feed.run(),
         signal_loop(mode, config, binance_feed, polymarket_feed, strategy, executor),
-        return_exceptions=True,  # don't let one task crash the others
+        return_exceptions=True,
     )
+
+    # ── Report any task that exited with an exception ─────────────────────────
+    task_names = ["BinanceFeed.run", "PolymarketFeed.run", "signal_loop"]
+    for name, result in zip(task_names, results):
+        if isinstance(result, Exception):
+            log_error(f"[Main] Task '{name}' exited with exception", result)
+        elif isinstance(result, BaseException):
+            log.error(f"[Main] Task '{name}' exited with: {result!r}")
 
 
 if __name__ == "__main__":
