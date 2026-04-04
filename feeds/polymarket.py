@@ -66,14 +66,47 @@ class PolymarketFeed:
         self.spread:     Optional[float] = None
         self._best_bid:  Optional[float] = None
         self._best_ask:  Optional[float] = None
+        self._down_best_bid: Optional[float] = None
+        self._down_best_ask: Optional[float] = None
         self._up_book_last_updated:   float = 0.0
         self._down_book_last_updated: float = 0.0
         self._connected = False
-        self._force_reconnect = False
+        # Reconnect signalling: use an asyncio.Event (state-based) so
+        # main.py doesn't need a time-based flag to coordinate reconnects.
+        self._reconnect_event: Optional[asyncio.Event] = None
 
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    # ── Book reset and reconnect control ─────────────────────────────────────────
+
+    def reset_book(self) -> None:
+        """
+        Clear all order-book and price state for a new market window.
+        Called by main.py after refresh_if_expired() returns True.
+        """
+        self._up_bids.clear()
+        self._up_asks.clear()
+        self._down_bids.clear()
+        self._down_asks.clear()
+        self._best_bid      = None
+        self._best_ask      = None
+        self._down_best_bid = None
+        self._down_best_ask = None
+        self.spread         = None
+        self.up_price       = None
+        self.down_price     = None
+        self._up_book_last_updated   = 0.0
+        self._down_book_last_updated = 0.0
+
+    def request_reconnect(self) -> None:
+        """
+        Signal the WebSocket run() loop to reconnect to the new token IDs.
+        Uses an asyncio.Event (state-based, not timer-based).
+        """
+        if self._reconnect_event is not None:
+            self._reconnect_event.set()
 
     # ── Market discovery ─────────────────────────────────────────────────────
 
@@ -192,6 +225,8 @@ class PolymarketFeed:
     WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     async def run(self) -> None:
+        # Initialise the reconnect event here so it's bound to the running loop.
+        self._reconnect_event = asyncio.Event()
         asyncio.get_event_loop().create_task(self._rest_price_poller())
 
         backoff = 1
@@ -213,6 +248,8 @@ class PolymarketFeed:
                 ) as ws:
                     self._connected = True
                     backoff = 1
+                    # Clear event from any previous cycle before entering receive loop.
+                    self._reconnect_event.clear()
 
                     self._up_bids.clear();   self._up_asks.clear()
                     self._down_bids.clear(); self._down_asks.clear()
@@ -230,8 +267,10 @@ class PolymarketFeed:
                     log.info("[Polymarket] Subscribed to order book for {}".format(self.market_id))
 
                     async for raw in ws:
-                        if self._force_reconnect:
-                            self._force_reconnect = False
+                        # State-based reconnect check (replaces old time-based _force_reconnect flag)
+                        if self._reconnect_event.is_set():
+                            self._reconnect_event.clear()
+                            log.info("[Polymarket] Reconnect requested — restarting WS for new market")
                             break
                         await self._handle_message(raw)
 
@@ -366,12 +405,21 @@ class PolymarketFeed:
             self.spread    = None
 
     def _update_down_from_best(self, best_bid: float, best_ask: float) -> None:
-        """Update DOWN token price using authoritative best bid/ask values."""
+        """Update DOWN token price using authoritative best bid/ask values.
+        Also tracks _down_best_bid and _down_best_ask so the executor can
+        fill at the real ask (entry) and bid (exit) rather than the mid.
+        """
         if best_bid > 0 and best_ask > 0 and best_ask > best_bid:
+            self._down_best_bid = best_bid
+            self._down_best_ask = best_ask
             self.down_price = (best_bid + best_ask) / 2
         elif best_bid > 0:
+            self._down_best_bid = best_bid
+            self._down_best_ask = None
             self.down_price = best_bid
         elif best_ask > 0:
+            self._down_best_bid = None
+            self._down_best_ask = best_ask
             self.down_price = best_ask
 
     @staticmethod
@@ -419,10 +467,16 @@ class PolymarketFeed:
         best_ask = min(self._down_asks.keys(), default=None)
 
         if best_bid is not None and best_ask is not None and best_ask > best_bid:
+            self._down_best_bid = best_bid
+            self._down_best_ask = best_ask
             self.down_price = (best_bid + best_ask) / 2
         elif best_bid is not None:
+            self._down_best_bid = best_bid
+            self._down_best_ask = None
             self.down_price = best_bid
         elif best_ask is not None:
+            self._down_best_bid = None
+            self._down_best_ask = best_ask
             self.down_price = best_ask
 
     def seconds_until_settlement(self) -> Optional[float]:
