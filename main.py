@@ -45,6 +45,7 @@ from strategy.latency_arb import LatencyArbStrategy
 from execution.test_executor import TestExecutor
 from execution.live_executor import LiveExecutor
 from logger import log, log_error, print_pnl_summary
+from telegram_notify import notify_startup, notify_signal
 
 
 def parse_args():
@@ -97,6 +98,7 @@ async def signal_loop(
     _refresh_in_flight = False
 
     log.info(f"[Main] Signal loop started in {mode.upper()} mode")
+    notify_startup(mode)
 
     while True:
         try:
@@ -141,6 +143,14 @@ async def signal_loop(
                     has_open_position=has_open,
                 )
                 if signal is not None:
+                    notify_signal(
+                        mode=mode,
+                        direction=signal.direction.value,
+                        btc_pct_change=signal.pct_change,
+                        pm_price=signal.polymarket_price,
+                        fair_prob=signal.fair_probability,
+                        edge=signal.edge,
+                    )
                     await executor.enter(signal, polymarket_feed)
 
             # ── Diagnostic ticker every 30s ───────────────────────────────────
