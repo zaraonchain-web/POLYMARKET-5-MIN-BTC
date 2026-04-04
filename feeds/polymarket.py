@@ -225,7 +225,12 @@ class PolymarketFeed:
         bids: Dict[float, float],
         asks: Dict[float, float],
     ) -> None:
-        for o in event.get("bids", []):
+        # NOTE: Polymarket CLOB WS sends sides from the TAKER's perspective.
+        # Their "bids" are resting asks in standard book terms (prices you pay
+        # to buy), and their "asks" are resting bids (prices you receive to
+        # sell). We swap them so our internal book uses the standard convention
+        # where bids < asks and spread = best_ask - best_bid > 0.
+        for o in event.get("asks", []):   # their "asks" = our resting bids
             try:
                 p = float(o.get("price") or o.get("p") or 0)
                 s = float(o.get("size")  or o.get("s") or 0)
@@ -238,7 +243,7 @@ class PolymarketFeed:
             except (TypeError, ValueError):
                 continue
 
-        for o in event.get("asks", []):
+        for o in event.get("bids", []):   # their "bids" = our resting asks
             try:
                 p = float(o.get("price") or o.get("p") or 0)
                 s = float(o.get("size")  or o.get("s") or 0)
