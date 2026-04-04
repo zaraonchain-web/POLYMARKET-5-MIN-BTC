@@ -17,13 +17,13 @@ polymarket:
 signal:
   # Rolling window (seconds) to compute BTC price change
   price_window_seconds: 30
-  # Minimum % price move to trigger a signal
-  price_change_threshold_pct: 0.15
-  # Only enter if Polymarket UP token price is in this range (market not yet repriced)
-  polymarket_min_price: 0.35
-  polymarket_max_price: 0.65
-  # Minimum edge (|fair_prob - polymarket_price|) required to enter
-  min_edge: 0.05
+  # Minimum % price move to trigger a signal (lowered from 0.15)
+  price_change_threshold_pct: 0.10
+  # Only enter if Polymarket UP token price is in this range (widened from 0.35/0.65)
+  polymarket_min_price: 0.25
+  polymarket_max_price: 0.75
+  # Minimum edge (|fair_prob - polymarket_price|) required to enter (lowered from 0.05)
+  min_edge: 0.03
 
 # --- Position Management ---
 position:
@@ -40,10 +40,10 @@ position:
 risk:
   # Stop trading if cumulative day loss exceeds this (USDC)
   daily_loss_limit_usdc: 100.0
-  # Don't enter trade in last N seconds of a 5-min market window
-  settlement_buffer_seconds: 60
-  # Skip signal if order book spread > this
-  max_spread: 0.03
+  # Don't enter trade in last N seconds of a 5-min market window (lowered from 60)
+  settlement_buffer_seconds: 30
+  # Skip signal if order book spread > this (widened from 0.03)
+  max_spread: 0.05
   # 5-minute market window duration (seconds) — used for settlement guard
   market_window_seconds: 300
 
