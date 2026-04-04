@@ -5,7 +5,7 @@ execution/utils.py — Shared utilities for live and test executors.
 # Fallback peak fee rate used when the live API rate is unavailable.
 # Based on Polymarket's crypto market fee schedule (March 2026).
 # Always prefer the live rate from polymarket_feed.fee_rate over this.
-_FALLBACK_PEAK_FEE_RATE = 0.018  # 1.8% peak at 50/50 odds
+_FALLBACK_PEAK_FEE_RATE = 0.10  # 1.8% peak at 50/50 odds
 
 
 def taker_fee_rate(token_price: float, live_fee_rate: float = None) -> float:
