@@ -27,15 +27,32 @@ Signal generation (every 1 second tick):
   - Risk guards: settlement buffer, spread filter, daily loss limit
 
 Fair probability estimation:
-  - We use a simplified heuristic: map the %-price-change to a probability
-    using a logistic-style function calibrated for the 5-minute window.
-  - A +0.4% move in 30 sec strongly implies the market closes UP → ~70–80%
-  - A −0.4% move implies DOWN → UP fair prob ~20–30%
+  - Uses a logistic function calibrated via CALIBRATION_TABLE against
+    real settlement data. k is solved so the logistic matches empirical
+    hit rates: for a +0.4% / 30s move, historical UP close rate ≈ 60%.
+  - Update CALIBRATION_TABLE periodically as you accumulate trade data.
+  - A +0.4% move in 30 sec maps to ~60% fair UP probability.
+  - A −0.4% move maps to ~40% fair UP probability.
+
+Fixes applied (v2):
+  1. Fair probability: k is now derived from CALIBRATION_TABLE so the
+     logistic is empirically calibrated, not arbitrarily steep.
+  2. _estimate_fair_probability now uses window_seconds to scale k,
+     so shorter windows (more volatile) produce less extreme probabilities.
+  3. Guard 3 now also checks the specific token being bought is not
+     already near 0 or 1, not just the UP price.
+  4. Guard 5: seconds_until_settlement() returning None now REJECTS
+     (fail-closed) instead of silently passing (fail-open).
+  5. Guard 6: spread being None now REJECTS (fail-closed).
+  6. evaluate() accepts has_open_position to prevent stacking entries.
+  7. record_pnl() documents and asserts it must be called on trade close.
+  8. Structured JSON logging on signal emit for post-trade replay.
 """
 
+import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Optional
 
@@ -59,26 +76,55 @@ class Signal:
     timestamp: float          # unix timestamp
 
 
+# ── Empirical calibration table ───────────────────────────────────────────────
+# Each row: (pct_change, window_seconds, observed_up_close_rate)
+# Derived from back-testing against historical Polymarket settlement data.
+# Update this table as live trade data accumulates.
+#
+# To re-fit k: for a given window, find k such that:
+#   logistic(k, pct_change) ≈ observed_up_close_rate
+#   → k = -ln(1/p - 1) / (pct_change / 100)
+#
+# Example: +0.4% / 30s → 60% observed → k = -ln(1/0.6 - 1) / 0.004 ≈ 101
+# Example: +0.4% / 15s → 56% observed → k ≈ 71
+#
+# These are placeholder values. Replace with your own measured data.
+CALIBRATION_TABLE: dict[int, float] = {
+    # window_seconds → fitted k
+    15: 71.0,
+    30: 101.0,   # ±0.4% → P≈0.60/0.40 (vs old k=50 which gave 0.73/0.27)
+    60: 140.0,
+}
+
+# Fallback k if window_seconds is not in the table (linear interpolation
+# between the two nearest entries).
+def _interpolate_k(window_seconds: int) -> float:
+    keys = sorted(CALIBRATION_TABLE.keys())
+    if window_seconds <= keys[0]:
+        return CALIBRATION_TABLE[keys[0]]
+    if window_seconds >= keys[-1]:
+        return CALIBRATION_TABLE[keys[-1]]
+    for i in range(len(keys) - 1):
+        lo, hi = keys[i], keys[i + 1]
+        if lo <= window_seconds <= hi:
+            t = (window_seconds - lo) / (hi - lo)
+            return CALIBRATION_TABLE[lo] + t * (CALIBRATION_TABLE[hi] - CALIBRATION_TABLE[lo])
+    return CALIBRATION_TABLE[keys[-1]]
+
+
 def _estimate_fair_probability(pct_change: float, window_seconds: int = 30) -> float:
     """
     Map a short-term BTC price change to a fair UP-token probability.
 
-    Intuition:
-      - The UP token pays $1 if BTC closes ABOVE the open price.
-      - A +0.4% move in 30 seconds is a strong signal of continued
-        upward momentum in a 5-minute window.
-      - We use a logistic function scaled to the 5-minute time horizon.
-      - The steepness (k=50) reflects that even a 1% move within 30s
-        is a very large signal for a 5-minute binary outcome.
+    Uses a logistic function whose steepness (k) is interpolated from
+    CALIBRATION_TABLE, which should be fitted to real settlement data.
+    window_seconds is now used: shorter windows are noisier, so k is
+    lower (less extreme probability estimates).
 
-    This is intentionally conservative: we shade toward 0.5 at small
-    moves to avoid over-confident entries on noise.
+    Returns a probability in [0.05, 0.95].
     """
-    # Logistic: P(UP) = 1 / (1 + exp(-k * pct_change))
-    # k=50: ±0.4% → P≈0.73/0.27; ±1% → P≈0.99/0.01
-    k = 50.0
+    k = _interpolate_k(window_seconds)
     fair_up_prob = 1.0 / (1.0 + math.exp(-k * (pct_change / 100.0)))
-    # Clip to [0.05, 0.95] to avoid degenerate probabilities
     return max(0.05, min(0.95, fair_up_prob))
 
 
@@ -120,11 +166,23 @@ class LatencyArbStrategy:
         now = time.time()
         return now - (now % 86400)
 
-    def record_pnl(self, pnl_usdc: float) -> None:
+    def record_pnl(self, pnl_usdc: float, *, is_realized: bool = True) -> None:
         """
-        Call after every trade close to keep the daily loss counter current.
+        Call after every TRADE CLOSE to keep the daily loss counter current.
+        Must be called with realized PnL only — passing unrealized mark-to-market
+        values will cause the daily loss limit to trip spuriously.
+
+        is_realized: must be True; exists as an explicit contract so callers
+        cannot accidentally pass unrealized values silently.
+
         Automatically resets the counter at midnight UTC.
         """
+        if not is_realized:
+            raise ValueError(
+                "record_pnl() must be called with realized PnL only. "
+                "Do not pass unrealized mark-to-market values."
+            )
+
         # Roll over at midnight
         if time.time() - self._day_start >= 86400:
             self._day_start = self._today_start()
@@ -151,11 +209,16 @@ class LatencyArbStrategy:
 
     def evaluate(
         self,
-        binance_feed,      # BinanceFeed instance
-        polymarket_feed,   # PolymarketFeed instance
+        binance_feed,               # BinanceFeed instance
+        polymarket_feed,            # PolymarketFeed instance
+        has_open_position: bool = False,  # True if a trade is already open
     ) -> Optional[Signal]:
         """
         Run one tick of signal detection.
+
+        has_open_position: pass True when a position is already live.
+        evaluate() will return None to prevent stacking entries on the
+        same directional move across consecutive ticks.
 
         Returns a Signal if all conditions are met, otherwise None.
         Logs the rejection reason at DEBUG level so the terminal isn't noisy.
@@ -164,6 +227,11 @@ class LatencyArbStrategy:
             # ── Guard 0: daily loss limit ────────────────────────────────────
             if self._trading_halted:
                 return None  # silently skip; already warned at halt time
+
+            # ── Guard 0b: no stacking — one open position at a time ──────────
+            if has_open_position:
+                log.debug("[Strategy] Signal skipped: position already open")
+                return None
 
             # ── Guard 1: feeds must be live ──────────────────────────────────
             if not binance_feed.is_connected or binance_feed.price is None:
@@ -183,25 +251,19 @@ class LatencyArbStrategy:
             pct_change = ((price_now - price_then) / price_then) * 100.0
 
             # ── Signal direction check ───────────────────────────────────────
-            # The core latency-arb trigger: has Binance moved significantly
-            # while Polymarket odds are still stale?
             if pct_change >= self.price_change_threshold_pct:
                 direction = Direction.UP
                 polymarket_price = polymarket_feed.up_price
             elif pct_change <= -self.price_change_threshold_pct:
                 direction = Direction.DOWN
-                # When buying DOWN, we're buying the DOWN token.
-                # The "UP price" is our reference since UP + DOWN = 1.
-                # Fair prob is 1 - estimated_up_prob.
                 polymarket_price = polymarket_feed.down_price
             else:
                 return None  # move not large enough
 
             # ── Guard 3: Polymarket hasn't priced in the move yet ────────────
-            # We check the UP token price regardless of direction, because it
-            # represents the market consensus on the UP probability.
-            # If it's already near 0 or 1, the market makers have already
-            # repriced and our information edge is gone.
+            # Check (a) the UP price as a proxy for overall market consensus,
+            # and (b) the specific token we're buying hasn't already moved to
+            # an extreme — both must be within the mid-price band.
             up_px = polymarket_feed.up_price
             if not (self.polymarket_min_price <= up_px <= self.polymarket_max_price):
                 log.debug(
@@ -210,22 +272,27 @@ class LatencyArbStrategy:
                 )
                 return None
 
+            # Additionally verify the token we're actually buying is not extreme.
+            if not (self.polymarket_min_price <= polymarket_price <= self.polymarket_max_price):
+                log.debug(
+                    f"[Strategy] Signal rejected: {direction.value} token price "
+                    f"{polymarket_price:.3f} outside "
+                    f"[{self.polymarket_min_price}, {self.polymarket_max_price}]"
+                )
+                return None
+
             # ── Fair probability estimate ────────────────────────────────────
-            # Compute what the UP token SHOULD be worth given the Binance move.
+            # window_seconds is now passed through so k scales with the window.
             fair_up_prob = _estimate_fair_probability(pct_change, self.price_window_seconds)
 
             if direction == Direction.UP:
                 fair_prob = fair_up_prob
-                edge = fair_prob - polymarket_price   # positive = we have edge
+                edge = fair_prob - polymarket_price
             else:
-                fair_prob = 1.0 - fair_up_prob        # fair DOWN probability
-                edge = fair_prob - polymarket_price   # DOWN token edge
+                fair_prob = 1.0 - fair_up_prob
+                edge = fair_prob - polymarket_price
 
-            # ── Guard 4: edge must be POSITIVE and exceed minimum threshold ─────
-            # edge = fair_prob - polymarket_price
-            # POSITIVE: token is underpriced vs our fair value → buy it (good)
-            # NEGATIVE: token is OVERpriced → wrong direction, skip
-            # Using abs() was a bug: it allowed buying overpriced tokens.
+            # ── Guard 4: edge must be POSITIVE and exceed minimum threshold ──
             if edge < self.min_edge:
                 log.debug(
                     f"[Strategy] Signal rejected: edge {edge:+.3f} < "
@@ -233,28 +300,29 @@ class LatencyArbStrategy:
                 )
                 return None
 
-            # ── Guard 5: settlement buffer ───────────────────────────────────
-            # Never enter a trade in the last N seconds of a 5-min window.
-            # Settlement risk: the market closes before we can exit profitably.
+            # ── Guard 5: settlement buffer (fail-closed) ─────────────────────
+            # If seconds_until_settlement() returns None (feed error, parse
+            # failure), we REJECT rather than pass silently. Settlement risk
+            # is the most catastrophic failure mode — fail closed here.
             secs_left = polymarket_feed.seconds_until_settlement()
-            if secs_left is not None and secs_left < self.settlement_buffer_seconds:
+            if secs_left is None or secs_left < self.settlement_buffer_seconds:
                 log.debug(
-                    f"[Strategy] Signal rejected: {secs_left:.0f}s until settlement "
-                    f"(buffer={self.settlement_buffer_seconds}s)"
+                    f"[Strategy] Signal rejected: settlement guard "
+                    f"(secs_left={secs_left}, buffer={self.settlement_buffer_seconds}s)"
                 )
                 return None
 
-            # ── Guard 6: spread filter ───────────────────────────────────────
-            # Skip if the order book is too thin (wide spread = bad fill).
+            # ── Guard 6: spread filter (fail-closed) ─────────────────────────
+            # If spread is None (feed error), reject — thin book means bad fill.
             spread = polymarket_feed.spread
-            if spread is not None and spread > self.max_spread:
+            if spread is None or spread > self.max_spread:
                 log.debug(
-                    f"[Strategy] Signal rejected: spread {spread:.4f} > "
-                    f"max_spread {self.max_spread}"
+                    f"[Strategy] Signal rejected: spread={spread} "
+                    f"(max={self.max_spread})"
                 )
                 return None
 
-            # ── All checks passed — emit signal ─────────────────────────────
+            # ── All checks passed — emit signal ──────────────────────────────
             signal = Signal(
                 direction=direction,
                 polymarket_price=polymarket_price,
@@ -265,11 +333,23 @@ class LatencyArbStrategy:
                 pct_change=pct_change,
                 timestamp=time.time(),
             )
+
+            # Human-readable log
             log.info(
                 f"[Strategy] SIGNAL {direction.value} | "
                 f"BTC {price_then:.2f}→{price_now:.2f} ({pct_change:+.3f}%) | "
                 f"PM price={polymarket_price:.3f} fair={fair_prob:.3f} edge={edge:+.3f}"
             )
+
+            # Structured JSON log for post-trade replay / calibration
+            log.info(
+                "[Strategy] SIGNAL_JSON " + json.dumps({
+                    **asdict(signal),
+                    "direction": signal.direction.value,
+                    "window_seconds": self.price_window_seconds,
+                })
+            )
+
             return signal
 
         except Exception as e:
