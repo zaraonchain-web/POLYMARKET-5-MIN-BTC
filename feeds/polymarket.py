@@ -214,7 +214,11 @@ class PolymarketFeed:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    bps = data.get("fee_rate_bps") or data.get("feeRateBps")
+                    bps = (
+                        data.get("fee_rate_bps")
+                        or data.get("feeRateBps")
+                        or data.get("base_fee")
+                    )
                     if bps is not None:
                         # Convert basis points to fraction: 180 bps → 0.0180
                         self.fee_rate = float(bps) / 10000.0
