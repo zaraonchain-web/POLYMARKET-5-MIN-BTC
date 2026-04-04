@@ -70,9 +70,10 @@ def log_trade(
     pnl_usdc: float,
     edge_at_entry: float,
     mode: str,
+    reason: str = "unknown",
     timestamp: Optional[datetime] = None,
 ) -> None:
-    """Append one completed trade row to results.csv."""
+    """Append one completed trade row to results.csv and notify Telegram."""
     _ensure_csv_header()
     if timestamp is None:
         timestamp = datetime.now(timezone.utc)
@@ -94,6 +95,19 @@ def log_trade(
         f"Trade logged | {direction} {market_id} | "
         f"entry={entry_price:.4f} exit={exit_price:.4f} "
         f"hold={hold_seconds:.0f}s pnl={pnl_usdc:+.4f} USDC edge={edge_at_entry:.3f}"
+    )
+
+    # Telegram notification (silently skipped if env vars not set)
+    from telegram_notify import notify_trade
+    notify_trade(
+        mode=mode,
+        direction=direction,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        hold_seconds=hold_seconds,
+        pnl_usdc=pnl_usdc,
+        edge_at_entry=edge_at_entry,
+        reason=reason,
     )
 
 
