@@ -5,8 +5,14 @@ Persistent order book implementation:
 - Full depth snapshot on WS connect, then delta updates
 - Each bid/ask level stored as price->size dict
 - Levels with size=0 are removed (market maker cancel)
-- best_bid = max(bids), best_ask = min(asks), mid = (best_bid+best_ask)/2
+- best_bid = max(bids), best_ask = min(asks), spread = best_ask - best_bid
 - Gamma API outcomePrices used to pre-seed prices before WS connects
+- REST /midpoint fallback polls every 5s when WS book is stale (known Polymarket freeze bug)
+
+Official WS message format (from docs.polymarket.com/developers/CLOB/websocket/market-channel):
+  Subscription : {"assets_ids": ["<token_id>", ...], "type": "market"}
+  Book event   : {"event_type": "book", "asset_id": "...", "bids": [{"price": ".48", "size": "30"},...], "asks": [...]}
+  Bids = lower prices (buyers), Asks = higher prices (sellers) — standard convention, NO inversion needed.
 
 Public interface:
     PolymarketFeed.market_id         -- active 5-min market condition ID
@@ -35,6 +41,11 @@ CLOB_REST  = "https://clob.polymarket.com"
 CLOB_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/"
 GAMMA_API  = "https://gamma-api.polymarket.com"
 
+# How many seconds of no WS book updates before we fall back to REST polling
+WS_STALE_THRESHOLD = 10.0
+# How often to poll REST midpoint when WS is stale (seconds)
+REST_POLL_INTERVAL = 5.0
+
 
 class PolymarketFeed:
 
@@ -56,14 +67,14 @@ class PolymarketFeed:
         self.up_price:   Optional[float] = None
         self.down_price: Optional[float] = None
         self.spread:     Optional[float] = None
-        self._best_bid:  Optional[float] = None   # UP token best bid
-        self._best_ask:  Optional[float] = None   # UP token best ask
-        self._down_best_bid: Optional[float] = None  # DOWN token best bid
-        self._down_best_ask: Optional[float] = None  # DOWN token best ask
+        self._best_bid:  Optional[float] = None
+        self._best_ask:  Optional[float] = None
+        self._down_best_bid: Optional[float] = None
+        self._down_best_ask: Optional[float] = None
         self._up_book_last_updated:   float = 0.0
         self._down_book_last_updated: float = 0.0
         self._connected = False
-        self._force_reconnect = False  # set True from outside to trigger WS reconnect
+        self._force_reconnect = False
 
     @property
     def is_connected(self) -> bool:
@@ -124,8 +135,6 @@ class PolymarketFeed:
             else:
                 return False
 
-            # Pre-seed prices from Gamma outcomePrices so we have a value
-            # before the WS snapshot arrives
             outcome_prices = market.get("outcomePrices")
             if outcome_prices:
                 if isinstance(outcome_prices, str):
@@ -147,9 +156,52 @@ class PolymarketFeed:
             log_error("[Polymarket] _populate_from_gamma_event error", e)
             return False
 
+    # ── REST midpoint fallback (handles Polymarket's known WS silent-freeze bug) ──
+
+    async def _rest_price_poller(self) -> None:
+        """
+        Polls CLOB REST /midpoint every REST_POLL_INTERVAL seconds when the WS
+        book has gone stale. This is the documented workaround for the Polymarket
+        CLOB WSS silent-freeze bug (github.com/Polymarket/py-clob-client/issues/292).
+        """
+        while True:
+            await asyncio.sleep(REST_POLL_INTERVAL)
+            try:
+                if self.up_token_id is None or self.down_token_id is None:
+                    continue
+
+                ws_age = time.time() - self._up_book_last_updated
+                if ws_age < WS_STALE_THRESHOLD:
+                    continue  # WS is fresh, no need to poll
+
+                async with aiohttp.ClientSession() as session:
+                    # Fetch UP midpoint
+                    async with session.get(
+                        "{}/midpoint".format(self.clob_rest_url),
+                        params={"token_id": self.up_token_id},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            mid = float(data.get("mid", 0))
+                            if 0 < mid < 1:
+                                self.up_price = mid
+                                self.down_price = round(1.0 - mid, 6)
+                                # REST doesn't give us spread; set None so strategy uses seed
+                                self.spread = None
+                                log.debug("[Polymarket] REST fallback: UP={:.4f} (WS stale {:.0f}s)".format(mid, ws_age))
+            except Exception as e:
+                log_error("[Polymarket] REST price poller error", e)
+
+    # ── WebSocket channel ─────────────────────────────────────────────────────
+
+    # Official WS endpoint per docs.polymarket.com/developers/CLOB/websocket/wss-overview
     WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     async def run(self) -> None:
+        # Start the REST fallback poller as a background task
+        asyncio.get_event_loop().create_task(self._rest_price_poller())
+
         backoff = 1
         while True:
             if self.market_id is None:
@@ -173,10 +225,14 @@ class PolymarketFeed:
                     # Clear stale book on reconnect
                     self._up_bids.clear();   self._up_asks.clear()
                     self._down_bids.clear(); self._down_asks.clear()
+                    self._up_book_last_updated = 0.0
 
+                    # Official subscription format per Polymarket docs:
+                    # {"assets_ids": ["<token_id>", ...], "type": "market"}
+                    # type must be lowercase "market" (not "Market" or "MARKET")
                     sub_msg = {
                         "assets_ids": [self.up_token_id, self.down_token_id],
-                        "type": "Market",
+                        "type": "market",
                     }
                     await ws.send(json.dumps(sub_msg))
                     log.info("[Polymarket] Subscribed to order book for {}".format(self.market_id))
@@ -209,13 +265,19 @@ class PolymarketFeed:
             msg    = json.loads(raw)
             events = msg if isinstance(msg, list) else [msg]
             for event in events:
+                if not isinstance(event, dict):
+                    continue
+                # Official field name per market channel docs is "asset_id"
                 asset_id = event.get("asset_id") or event.get("token_id")
                 if asset_id == self.up_token_id:
                     self._apply_book_update(event, self._up_bids, self._up_asks)
                     self._recompute_up_price()
+                    self._up_book_last_updated = time.time()
                 elif asset_id == self.down_token_id:
                     self._apply_book_update(event, self._down_bids, self._down_asks)
                     self._recompute_down_price()
+                    self._down_book_last_updated = time.time()
+                # else: could be empty [], heartbeat, or other event — silently ignore
         except (json.JSONDecodeError, TypeError) as e:
             log_error("[Polymarket] Failed to parse WS message: {}".format(raw[:200]), e)
 
@@ -225,12 +287,15 @@ class PolymarketFeed:
         bids: Dict[float, float],
         asks: Dict[float, float],
     ) -> None:
-        # NOTE: Polymarket CLOB WS sends sides from the TAKER's perspective.
-        # Their "bids" are resting asks in standard book terms (prices you pay
-        # to buy), and their "asks" are resting bids (prices you receive to
-        # sell). We swap them so our internal book uses the standard convention
-        # where bids < asks and spread = best_ask - best_bid > 0.
-        for o in event.get("asks", []):   # their "asks" = our resting bids
+        """
+        Apply a book snapshot or delta update to the in-memory order book.
+
+        Per official Polymarket docs, the book event format is standard:
+          bids = resting buy orders (lower prices, e.g. [".48", ".49"])
+          asks = resting sell orders (higher prices, e.g. [".52", ".53"])
+        No inversion needed.
+        """
+        for o in event.get("bids", []):
             try:
                 p = float(o.get("price") or o.get("p") or 0)
                 s = float(o.get("size")  or o.get("s") or 0)
@@ -243,7 +308,7 @@ class PolymarketFeed:
             except (TypeError, ValueError):
                 continue
 
-        for o in event.get("bids", []):   # their "bids" = our resting asks
+        for o in event.get("asks", []):
             try:
                 p = float(o.get("price") or o.get("p") or 0)
                 s = float(o.get("size")  or o.get("s") or 0)
@@ -259,7 +324,6 @@ class PolymarketFeed:
     def _recompute_up_price(self) -> None:
         best_bid = max(self._up_bids.keys(), default=None)
         best_ask = min(self._up_asks.keys(), default=None)
-        self._up_book_last_updated = time.time()
 
         if best_bid is not None and best_ask is not None:
             self.up_price  = (best_bid + best_ask) / 2
@@ -277,7 +341,6 @@ class PolymarketFeed:
             self._best_ask = best_ask
             self.spread    = None
         else:
-            # Book is empty — keep seed price from Gamma, clear stale spread
             self._best_bid = None
             self._best_ask = None
             self.spread    = None
@@ -285,7 +348,6 @@ class PolymarketFeed:
     def _recompute_down_price(self) -> None:
         best_bid = max(self._down_bids.keys(), default=None)
         best_ask = min(self._down_asks.keys(), default=None)
-        self._down_book_last_updated = time.time()
 
         self._down_best_bid = best_bid
         self._down_best_ask = best_ask
