@@ -263,6 +263,7 @@ class TestExecutor:
                 pnl_usdc=net_pnl,
                 edge_at_entry=pos.edge_at_entry,
                 mode="test",
+                reason=reason,
             )
 
             self.strategy.record_pnl(net_pnl)
