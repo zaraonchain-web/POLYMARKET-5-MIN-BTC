@@ -359,6 +359,7 @@ class LiveExecutor:
                 pnl_usdc=pnl_usdc,
                 edge_at_entry=pos.edge_at_entry,
                 mode="live",
+                reason=reason,
             )
 
             self.strategy.record_pnl(pnl_usdc)
