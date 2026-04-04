@@ -55,6 +55,10 @@ class PolymarketFeed:
         self.down_token_id: Optional[str]   = None
         self.market_end_ts: Optional[float] = None
 
+        # Live fee rate fetched from CLOB API once per market window.
+        # Stored as a fraction (e.g. 0.018 = 1.8%). None = not yet fetched.
+        self.fee_rate: Optional[float] = None
+
         # Persistent order books: price_float -> size_float
         self._up_bids:   Dict[float, float] = {}
         self._up_asks:   Dict[float, float] = {}
@@ -99,6 +103,7 @@ class PolymarketFeed:
         self.down_price     = None
         self._up_book_last_updated   = 0.0
         self._down_book_last_updated = 0.0
+        self.fee_rate = None
 
     def request_reconnect(self) -> None:
         """
@@ -138,6 +143,8 @@ class PolymarketFeed:
                                     slug
                                 )
                             )
+                            # Fetch live fee rate for this market window
+                            await self._fetch_fee_rate(session)
                             return True
             log_error("[Polymarket] No active 5-minute BTC market found")
             return False
@@ -185,6 +192,43 @@ class PolymarketFeed:
         except Exception as e:
             log_error("[Polymarket] _populate_from_gamma_event error", e)
             return False
+
+    async def _fetch_fee_rate(self, session: aiohttp.ClientSession) -> None:
+        """
+        Fetch the live taker fee rate for the UP token from the CLOB API.
+        Called once per market window inside fetch_active_market().
+        Stores result as a fraction in self.fee_rate (e.g. 0.018 = 1.8% peak).
+        Falls back to None on any error — executors will use the formula fallback.
+
+        API: GET https://clob.polymarket.com/fee-rate?token_id={token_id}
+        Response: {"fee_rate_bps": "180"} where bps = basis points (100 bps = 1%)
+        """
+        if self.up_token_id is None:
+            return
+        try:
+            url = "{}/fee-rate".format(self.clob_rest_url)
+            async with session.get(
+                url,
+                params={"token_id": self.up_token_id},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    bps = data.get("fee_rate_bps") or data.get("feeRateBps")
+                    if bps is not None:
+                        # Convert basis points to fraction: 180 bps → 0.0180
+                        self.fee_rate = float(bps) / 10000.0
+                        log.info(
+                            "[Polymarket] Live fee rate: {:.4f} ({:.2f}% peak) for token {}...".format(
+                                self.fee_rate, self.fee_rate * 100, self.up_token_id[:20]
+                            )
+                        )
+                    else:
+                        log.warning("[Polymarket] fee-rate response missing bps field: {}".format(data))
+                else:
+                    log.warning("[Polymarket] fee-rate API returned status {}".format(resp.status))
+        except Exception as e:
+            log_error("[Polymarket] _fetch_fee_rate failed — will use formula fallback", e)
 
     # ── REST midpoint fallback ────────────────────────────────────────────────
 
