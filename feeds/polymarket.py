@@ -1,29 +1,28 @@
 """
 feeds/polymarket.py — Polymarket CLOB WebSocket + REST handler
 
-Persistent order book implementation:
-- Full depth snapshot on WS connect, then delta updates
-- Each bid/ask level stored as price->size dict
-- Levels with size=0 are removed (market maker cancel)
-- best_bid = max(bids), best_ask = min(asks), spread = best_ask - best_bid
-- Gamma API outcomePrices used to pre-seed prices before WS connects
-- REST /midpoint fallback polls every 5s when WS book is stale (known Polymarket freeze bug)
+Official WS message types (docs.polymarket.com/market-data/websocket/market-channel):
 
-Official WS message format (from docs.polymarket.com/developers/CLOB/websocket/market-channel):
-  Subscription : {"assets_ids": ["<token_id>", ...], "type": "market"}
-  Book event   : {"event_type": "book", "asset_id": "...", "bids": [{"price": ".48", "size": "30"},...], "asks": [...]}
-  Bids = lower prices (buyers), Asks = higher prices (sellers) — standard convention, NO inversion needed.
+  book         — Full snapshot on subscribe + after trades.
+                 Top-level asset_id. bids/asks are standard: bids < asks.
+                 {"event_type":"book","asset_id":"...","bids":[{"price":".48","size":"30"},...],
+                  "asks":[{"price":".52","size":"25"},...]}
 
-Public interface:
-    PolymarketFeed.market_id         -- active 5-min market condition ID
-    PolymarketFeed.up_price          -- current UP token mid (0-1)
-    PolymarketFeed.down_price        -- current DOWN token mid (0-1)
-    PolymarketFeed.spread            -- best ask - best bid for UP token
-    PolymarketFeed.market_end_ts     -- unix timestamp of market close
-    PolymarketFeed.up_token_id       -- token ID for UP (needed for orders)
-    PolymarketFeed.down_token_id     -- token ID for DOWN
-    PolymarketFeed.run()             -- coroutine; keeps WS alive forever
-    PolymarketFeed.fetch_active_market() -- one-shot REST call at startup
+  price_change — New order placed or cancelled. Nested structure:
+                 {"event_type":"price_change","market":"...","price_changes":[
+                   {"asset_id":"...","price":"0.5","size":"200","side":"BUY",
+                    "best_bid":"0.5","best_ask":"1","hash":"..."},
+                   ...
+                 ]}
+                 size="0" means the level was removed.
+                 best_bid/best_ask are the new top-of-book after the change.
+
+  best_bid_ask — (custom_feature_enabled only) Emitted when best bid/ask changes.
+                 {"event_type":"best_bid_ask","asset_id":"...","best_bid":"0.73","best_ask":"0.77","spread":"0.04"}
+
+Strategy: parse all three event types. Use best_bid/best_ask from price_change
+and best_bid_ask directly — these give us the authoritative top-of-book without
+having to maintain a full depth ladder from deltas.
 """
 
 import asyncio
@@ -41,10 +40,8 @@ CLOB_REST  = "https://clob.polymarket.com"
 CLOB_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/"
 GAMMA_API  = "https://gamma-api.polymarket.com"
 
-# How many seconds of no WS book updates before we fall back to REST polling
-WS_STALE_THRESHOLD = 10.0
-# How often to poll REST midpoint when WS is stale (seconds)
-REST_POLL_INTERVAL = 5.0
+WS_STALE_THRESHOLD = 10.0   # seconds before REST fallback kicks in
+REST_POLL_INTERVAL = 5.0    # REST polling interval when WS is stale
 
 
 class PolymarketFeed:
@@ -69,8 +66,6 @@ class PolymarketFeed:
         self.spread:     Optional[float] = None
         self._best_bid:  Optional[float] = None
         self._best_ask:  Optional[float] = None
-        self._down_best_bid: Optional[float] = None
-        self._down_best_ask: Optional[float] = None
         self._up_book_last_updated:   float = 0.0
         self._down_book_last_updated: float = 0.0
         self._connected = False
@@ -79,6 +74,8 @@ class PolymarketFeed:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    # ── Market discovery ─────────────────────────────────────────────────────
 
     async def fetch_active_market(self) -> bool:
         import math
@@ -156,26 +153,24 @@ class PolymarketFeed:
             log_error("[Polymarket] _populate_from_gamma_event error", e)
             return False
 
-    # ── REST midpoint fallback (handles Polymarket's known WS silent-freeze bug) ──
+    # ── REST midpoint fallback ────────────────────────────────────────────────
 
     async def _rest_price_poller(self) -> None:
         """
-        Polls CLOB REST /midpoint every REST_POLL_INTERVAL seconds when the WS
-        book has gone stale. This is the documented workaround for the Polymarket
-        CLOB WSS silent-freeze bug (github.com/Polymarket/py-clob-client/issues/292).
+        Polls CLOB REST /midpoint when WS book is stale.
+        Workaround for Polymarket's known WS silent-freeze bug.
+        (github.com/Polymarket/py-clob-client/issues/292)
         """
         while True:
             await asyncio.sleep(REST_POLL_INTERVAL)
             try:
-                if self.up_token_id is None or self.down_token_id is None:
+                if self.up_token_id is None:
                     continue
-
                 ws_age = time.time() - self._up_book_last_updated
                 if ws_age < WS_STALE_THRESHOLD:
-                    continue  # WS is fresh, no need to poll
+                    continue
 
                 async with aiohttp.ClientSession() as session:
-                    # Fetch UP midpoint
                     async with session.get(
                         "{}/midpoint".format(self.clob_rest_url),
                         params={"token_id": self.up_token_id},
@@ -185,21 +180,18 @@ class PolymarketFeed:
                             data = await resp.json()
                             mid = float(data.get("mid", 0))
                             if 0 < mid < 1:
-                                self.up_price = mid
+                                self.up_price   = mid
                                 self.down_price = round(1.0 - mid, 6)
-                                # REST doesn't give us spread; set None so strategy uses seed
-                                self.spread = None
+                                self.spread     = None  # REST has no spread
                                 log.debug("[Polymarket] REST fallback: UP={:.4f} (WS stale {:.0f}s)".format(mid, ws_age))
             except Exception as e:
                 log_error("[Polymarket] REST price poller error", e)
 
-    # ── WebSocket channel ─────────────────────────────────────────────────────
+    # ── WebSocket ─────────────────────────────────────────────────────────────
 
-    # Official WS endpoint per docs.polymarket.com/developers/CLOB/websocket/wss-overview
     WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     async def run(self) -> None:
-        # Start the REST fallback poller as a background task
         asyncio.get_event_loop().create_task(self._rest_price_poller())
 
         backoff = 1
@@ -222,17 +214,17 @@ class PolymarketFeed:
                     self._connected = True
                     backoff = 1
 
-                    # Clear stale book on reconnect
                     self._up_bids.clear();   self._up_asks.clear()
                     self._down_bids.clear(); self._down_asks.clear()
                     self._up_book_last_updated = 0.0
 
-                    # Official subscription format per Polymarket docs:
-                    # {"assets_ids": ["<token_id>", ...], "type": "market"}
-                    # type must be lowercase "market" (not "Market" or "MARKET")
+                    # Official subscription per docs:
+                    # {"assets_ids": [...], "type": "market", "custom_feature_enabled": true}
+                    # custom_feature_enabled gives us best_bid_ask events — the cleanest price source.
                     sub_msg = {
                         "assets_ids": [self.up_token_id, self.down_token_id],
                         "type": "market",
+                        "custom_feature_enabled": True,
                     }
                     await ws.send(json.dumps(sub_msg))
                     log.info("[Polymarket] Subscribed to order book for {}".format(self.market_id))
@@ -260,6 +252,8 @@ class PolymarketFeed:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
+    # ── Message parsing ───────────────────────────────────────────────────────
+
     async def _handle_message(self, raw: str) -> None:
         try:
             msg    = json.loads(raw)
@@ -267,57 +261,132 @@ class PolymarketFeed:
             for event in events:
                 if not isinstance(event, dict):
                     continue
-                # Official field name per market channel docs is "asset_id"
-                asset_id = event.get("asset_id") or event.get("token_id")
-                if asset_id == self.up_token_id:
-                    self._apply_book_update(event, self._up_bids, self._up_asks)
-                    self._recompute_up_price()
-                    self._up_book_last_updated = time.time()
-                elif asset_id == self.down_token_id:
-                    self._apply_book_update(event, self._down_bids, self._down_asks)
-                    self._recompute_down_price()
-                    self._down_book_last_updated = time.time()
-                # else: could be empty [], heartbeat, or other event — silently ignore
+                event_type = event.get("event_type", "")
+
+                if event_type == "book":
+                    # Full depth snapshot — standard bids/asks at top level
+                    self._handle_book_event(event)
+
+                elif event_type == "price_change":
+                    # Nested structure: price_changes is a list, each entry has asset_id
+                    self._handle_price_change_event(event)
+
+                elif event_type == "best_bid_ask":
+                    # Authoritative best bid/ask — use directly, no book math needed
+                    self._handle_best_bid_ask_event(event)
+
+                # other event types (tick_size_change, last_trade_price, etc.) — ignore
+
         except (json.JSONDecodeError, TypeError) as e:
             log_error("[Polymarket] Failed to parse WS message: {}".format(raw[:200]), e)
 
-    @staticmethod
-    def _apply_book_update(
-        event: dict,
-        bids: Dict[float, float],
-        asks: Dict[float, float],
-    ) -> None:
-        """
-        Apply a book snapshot or delta update to the in-memory order book.
+    def _handle_book_event(self, event: dict) -> None:
+        """Full depth snapshot — emitted on subscribe and after trades."""
+        asset_id = event.get("asset_id") or event.get("token_id")
+        if asset_id == self.up_token_id:
+            self._up_bids.clear()
+            self._up_asks.clear()
+            self._apply_book_levels(event.get("bids", []), self._up_bids)
+            self._apply_book_levels(event.get("asks", []), self._up_asks)
+            self._recompute_up_price()
+            self._up_book_last_updated = time.time()
+        elif asset_id == self.down_token_id:
+            self._down_bids.clear()
+            self._down_asks.clear()
+            self._apply_book_levels(event.get("bids", []), self._down_bids)
+            self._apply_book_levels(event.get("asks", []), self._down_asks)
+            self._recompute_down_price()
+            self._down_book_last_updated = time.time()
 
-        Per official Polymarket docs, the book event format is standard:
-          bids = resting buy orders (lower prices, e.g. [".48", ".49"])
-          asks = resting sell orders (higher prices, e.g. [".52", ".53"])
-        No inversion needed.
+    def _handle_price_change_event(self, event: dict) -> None:
         """
-        for o in event.get("bids", []):
-            try:
-                p = float(o.get("price") or o.get("p") or 0)
-                s = float(o.get("size")  or o.get("s") or 0)
-                if p <= 0:
-                    continue
-                if s == 0:
-                    bids.pop(p, None)
-                else:
-                    bids[p] = s
-            except (TypeError, ValueError):
+        price_change has a nested structure with a price_changes list.
+        Each entry contains asset_id, price, size, side, best_bid, best_ask.
+        We use best_bid/best_ask directly — these are the authoritative new
+        top-of-book values, no need to track all depth levels.
+        """
+        for change in event.get("price_changes", []):
+            if not isinstance(change, dict):
+                continue
+            asset_id = change.get("asset_id")
+            best_bid_str = change.get("best_bid")
+            best_ask_str = change.get("best_ask")
+
+            if best_bid_str is None or best_ask_str is None:
                 continue
 
-        for o in event.get("asks", []):
+            try:
+                best_bid = float(best_bid_str)
+                best_ask = float(best_ask_str)
+            except (ValueError, TypeError):
+                continue
+
+            if asset_id == self.up_token_id:
+                self._update_up_from_best(best_bid, best_ask)
+                self._up_book_last_updated = time.time()
+            elif asset_id == self.down_token_id:
+                self._update_down_from_best(best_bid, best_ask)
+                self._down_book_last_updated = time.time()
+
+    def _handle_best_bid_ask_event(self, event: dict) -> None:
+        """
+        best_bid_ask — requires custom_feature_enabled:true.
+        Most direct source: best_bid, best_ask, spread are all given.
+        """
+        asset_id = event.get("asset_id")
+        try:
+            best_bid = float(event.get("best_bid", 0))
+            best_ask = float(event.get("best_ask", 0))
+        except (ValueError, TypeError):
+            return
+
+        if asset_id == self.up_token_id:
+            self._update_up_from_best(best_bid, best_ask)
+            self._up_book_last_updated = time.time()
+        elif asset_id == self.down_token_id:
+            self._update_down_from_best(best_bid, best_ask)
+            self._down_book_last_updated = time.time()
+
+    def _update_up_from_best(self, best_bid: float, best_ask: float) -> None:
+        """Update UP token price using authoritative best bid/ask values."""
+        if best_bid > 0 and best_ask > 0 and best_ask > best_bid:
+            self._best_bid = best_bid
+            self._best_ask = best_ask
+            self.up_price  = (best_bid + best_ask) / 2
+            self.spread    = round(best_ask - best_bid, 6)
+        elif best_bid > 0:
+            self._best_bid = best_bid
+            self._best_ask = None
+            self.up_price  = best_bid
+            self.spread    = None
+        elif best_ask > 0:
+            self._best_bid = None
+            self._best_ask = best_ask
+            self.up_price  = best_ask
+            self.spread    = None
+
+    def _update_down_from_best(self, best_bid: float, best_ask: float) -> None:
+        """Update DOWN token price using authoritative best bid/ask values."""
+        if best_bid > 0 and best_ask > 0 and best_ask > best_bid:
+            self.down_price = (best_bid + best_ask) / 2
+        elif best_bid > 0:
+            self.down_price = best_bid
+        elif best_ask > 0:
+            self.down_price = best_ask
+
+    @staticmethod
+    def _apply_book_levels(levels: list, book: Dict[float, float]) -> None:
+        """Apply a list of {price, size} levels to a book dict."""
+        for o in levels:
             try:
                 p = float(o.get("price") or o.get("p") or 0)
                 s = float(o.get("size")  or o.get("s") or 0)
                 if p <= 0:
                     continue
                 if s == 0:
-                    asks.pop(p, None)
+                    book.pop(p, None)
                 else:
-                    asks[p] = s
+                    book[p] = s
             except (TypeError, ValueError):
                 continue
 
@@ -325,20 +394,20 @@ class PolymarketFeed:
         best_bid = max(self._up_bids.keys(), default=None)
         best_ask = min(self._up_asks.keys(), default=None)
 
-        if best_bid is not None and best_ask is not None:
-            self.up_price  = (best_bid + best_ask) / 2
+        if best_bid is not None and best_ask is not None and best_ask > best_bid:
             self._best_bid = best_bid
             self._best_ask = best_ask
+            self.up_price  = (best_bid + best_ask) / 2
             self.spread    = round(best_ask - best_bid, 6)
         elif best_bid is not None:
-            self.up_price  = best_bid
             self._best_bid = best_bid
             self._best_ask = None
+            self.up_price  = best_bid
             self.spread    = None
         elif best_ask is not None:
-            self.up_price  = best_ask
             self._best_bid = None
             self._best_ask = best_ask
+            self.up_price  = best_ask
             self.spread    = None
         else:
             self._best_bid = None
@@ -349,10 +418,7 @@ class PolymarketFeed:
         best_bid = max(self._down_bids.keys(), default=None)
         best_ask = min(self._down_asks.keys(), default=None)
 
-        self._down_best_bid = best_bid
-        self._down_best_ask = best_ask
-
-        if best_bid is not None and best_ask is not None:
+        if best_bid is not None and best_ask is not None and best_ask > best_bid:
             self.down_price = (best_bid + best_ask) / 2
         elif best_bid is not None:
             self.down_price = best_bid
