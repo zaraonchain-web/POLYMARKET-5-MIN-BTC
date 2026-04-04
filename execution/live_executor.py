@@ -268,7 +268,10 @@ class LiveExecutor:
                 hold_elapsed = time.time() - pos.entry_time
                 pct_profit   = (exit_ref - pos.entry_price) / pos.entry_price
 
-                if pct_profit >= self.take_profit_pct:
+                # 30s minimum hold before checking take-profit — prevents
+                # an immediate exit triggered by a stale WS tick or own-order
+                # book impact in the seconds right after entry.
+                if hold_elapsed >= 30 and pct_profit >= self.take_profit_pct:
                     await self._close_position(client, exit_ref, hold_elapsed, "take-profit")
                     return
 
