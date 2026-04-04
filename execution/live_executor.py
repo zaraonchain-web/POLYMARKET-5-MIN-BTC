@@ -246,28 +246,39 @@ class LiveExecutor:
                 if pos is None:
                     break
 
-                current_price = (
-                    polymarket_feed.up_price
-                    if pos.direction == Direction.UP
-                    else polymarket_feed.down_price
-                )
-                if current_price is None:
+                # Use the BID as our exit reference — that's what we receive
+                # as a taker selling. Using mid triggers take-profit too early
+                # since the real fill comes in ~0.01 below mid.
+                if pos.direction == Direction.UP:
+                    bid_price = polymarket_feed._best_bid
+                    mid_price = polymarket_feed.up_price
+                    exit_ref  = bid_price if bid_price is not None else (
+                        round(mid_price - 0.005, 4) if mid_price is not None else None
+                    )
+                else:
+                    bid_price = getattr(polymarket_feed, "_down_best_bid", None)
+                    mid_price = polymarket_feed.down_price
+                    exit_ref  = bid_price if bid_price is not None else (
+                        round(mid_price - 0.005, 4) if mid_price is not None else None
+                    )
+
+                if exit_ref is None:
                     continue
 
                 hold_elapsed = time.time() - pos.entry_time
-                pct_profit   = (current_price - pos.entry_price) / pos.entry_price
+                pct_profit   = (exit_ref - pos.entry_price) / pos.entry_price
 
                 if pct_profit >= self.take_profit_pct:
-                    await self._close_position(client, current_price, hold_elapsed, "take-profit")
+                    await self._close_position(client, exit_ref, hold_elapsed, "take-profit")
                     return
 
                 if hold_elapsed >= self.hold_seconds:
-                    await self._close_position(client, current_price, hold_elapsed, "hold-timeout")
+                    await self._close_position(client, exit_ref, hold_elapsed, "hold-timeout")
                     return
 
                 secs_left = polymarket_feed.seconds_until_settlement()
                 if secs_left is not None and secs_left <= 5:
-                    await self._close_position(client, current_price, hold_elapsed, "settlement")
+                    await self._close_position(client, exit_ref, hold_elapsed, "settlement")
                     return
 
         except Exception as e:
@@ -316,12 +327,15 @@ class LiveExecutor:
             except Exception as e:
                 log_error("[LiveExecutor] Sell order failed — position may need manual close", e)
 
-            pnl_usdc = (exit_price - pos.entry_price) * pos.shares
+            # P&L uses sell_price (actual fill) not exit_price (the bid that
+            # triggered the decision). sell_price = exit_price - 0.01, so using
+            # exit_price would overstate net P&L by ~0.01 * shares per trade.
+            pnl_usdc = (sell_price - pos.entry_price) * pos.shares
 
             log.info(
-                "[LIVE] EXIT {} | reason={} entry={:.4f} exit={:.4f} hold={:.0f}s pnl={:+.4f} USDC".format(
+                "[LIVE] EXIT {} | reason={} entry={:.4f} fill={:.4f} hold={:.0f}s pnl={:+.4f} USDC".format(
                     pos.direction.value, reason, pos.entry_price,
-                    exit_price, hold_seconds, pnl_usdc
+                    sell_price, hold_seconds, pnl_usdc
                 )
             )
 
@@ -329,7 +343,7 @@ class LiveExecutor:
                 market_id=pos.market_id,
                 direction=pos.direction.value,
                 entry_price=pos.entry_price,
-                exit_price=exit_price,
+                exit_price=sell_price,
                 hold_seconds=hold_seconds,
                 pnl_usdc=pnl_usdc,
                 edge_at_entry=pos.edge_at_entry,
