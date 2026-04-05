@@ -20,7 +20,7 @@ signal:
   # Minimum % price move to trigger a signal.
   # 0.10% fires on noise constantly and will bleed fees. Keep at 0.40%.
   # Only lower once you have calibration data proving edge at smaller moves.
-  price_change_threshold_pct: 0.01
+  price_change_threshold_pct: 0.25
   # Only enter if Polymarket UP token is in this range.
   # Widening to 0.25/0.75 lets you enter when the market has ALREADY moved
   # significantly — exactly when the latency edge is gone. Keep at 0.35/0.65.
@@ -29,7 +29,7 @@ signal:
   # Minimum edge (fair_prob - market_price) required to enter.
   # 0.03 is below the round-trip cost (spread + 2x fees ≈ 0.02-0.04).
   # At 0.03 edge you are paying to trade. Keep at 0.10.
-  min_edge: 0.10
+  min_edge: 0.20
 
 # --- Position Management ---
 position:
